@@ -1,0 +1,185 @@
+# app.py - API para integração SFMC-BLIP
+
+from flask import Flask, request, jsonify
+import requests
+import os
+import json
+import logging
+from dotenv import load_dotenv
+from nlp_parser import QueryParser
+
+# Carregar variáveis de ambiente
+load_dotenv()
+
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
+# Configurações SFMC
+SFMC_BASE_URL = os.getenv("SFMC_BASE_URL")
+SFMC_CLIENT_ID = os.getenv("SFMC_CLIENT_ID")
+SFMC_CLIENT_SECRET = os.getenv("SFMC_CLIENT_SECRET")
+SFMC_AUTH_URL = os.getenv("SFMC_AUTH_URL")
+
+# Configurações BLIP
+BLIP_API_KEY = os.getenv("BLIP_API_KEY")
+BLIP_BASE_URL = os.getenv("BLIP_BASE_URL")
+
+# Instanciar o parser de consultas
+query_parser = QueryParser()
+
+def get_sfmc_token():
+    """Obtém token de autenticação para o Salesforce Marketing Cloud"""
+    payload = {
+        'grant_type': 'client_credentials',
+        'client_id': SFMC_CLIENT_ID,
+        'client_secret': SFMC_CLIENT_SECRET
+    }
+    
+    response = requests.post(SFMC_AUTH_URL, data=payload)
+    if response.status_code == 200:
+        return response.json().get('access_token')
+    else:
+        logging.error(f"Erro ao obter token SFMC: {response.text}")
+        return None
+
+def create_data_extension(token, name, fields):
+    """Cria uma Data Extension no SFMC"""
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    
+    payload = {
+        "name": name,
+        "customerKey": name,
+        "fields": fields,
+        "category": {
+            "id": 12345  # ID da pasta no SFMC
+        }
+    }
+    
+    url = f"{SFMC_BASE_URL}/data/v1/customobjectdata/key/dataextension/schema"
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code in [200, 201, 202]:
+        return True
+    else:
+        logging.error(f"Erro ao criar DE: {response.text}")
+        return False
+
+def execute_query_to_data_extension(token, sql_query, destination):
+    """Executa uma query SQL e salva os resultados na Data Extension"""
+    headers = {
+        'Authorization': f'Bearer {token}',
+        'Content-Type': 'application/json'
+    }
+    
+    payload = {
+        "queryText": sql_query,
+        "targetType": "DE",
+        "targetName": destination,
+        "targetUpdateType": "overwrite"
+    }
+    
+    url = f"{SFMC_BASE_URL}/automation/v1/queries/execute"
+    response = requests.post(url, headers=headers, json=payload)
+    
+    if response.status_code in [200, 201, 202]:
+        return True, response.json()
+    else:
+        logging.error(f"Erro ao executar query: {response.text}")
+        return False, response.text
+
+def send_blip_notification(message, to):
+    """Envia notificação pelo BLIP"""
+    headers = {
+        'Authorization': f'Key {BLIP_API_KEY}',
+        'Content-Type': 'application/json'
+    }
+    
+    payload = {
+        "id": f"{to}@messenger.gw.msging.net",
+        "to": to,
+        "type": "text/plain",
+        "content": message
+    }
+    
+    response = requests.post(f"{BLIP_BASE_URL}/messages", headers=headers, json=payload)
+    
+    if response.status_code == 200:
+        return True
+    else:
+        logging.error(f"Erro ao enviar mensagem BLIP: {response.text}")
+        return False
+
+@app.route('/api/process-query', methods=['POST'])
+def process_natural_query():
+    """
+    Endpoint para processar consultas em linguagem natural
+    
+    Exemplo de payload:
+    {
+        "query": "Preciso de 3.000 alunos ativos de SP, exceto inadimplentes, para campanha de pós-graduação",
+        "user_id": "12345" // ID do usuário no BLIP
+    }
+    """
+    data = request.json
+    natural_query = data.get('query')
+    user_id = data.get('user_id')
+    
+    if not natural_query:
+        return jsonify({"error": "Query parameter is required"}), 400
+    
+    # Analisar a consulta
+    try:
+        params = query_parser.parse_query(natural_query)
+        sql = query_parser.generate_sql(params)
+        
+        # Obter token SFMC
+        token = get_sfmc_token()
+        if not token:
+            return jsonify({"error": "Failed to authenticate with SFMC"}), 500
+        
+        # Definir campos padrão para a Data Extension
+        fields = [
+            {"name": "SubscriberKey", "type": "Text", "length": 50, "isPrimaryKey": True},
+            {"name": "EmailAddress", "type": "EmailAddress", "length": 254},
+            {"name": "Nome", "type": "Text", "length": 100},
+            {"name": "Sobrenome", "type": "Text", "length": 100},
+            {"name": "Telefone", "type": "Phone", "length": 50}
+        ]
+        
+        # Criar a Data Extension
+        de_success = create_data_extension(token, params['destino'], fields)
+        if not de_success:
+            return jsonify({"error": "Failed to create Data Extension"}), 500
+        
+        # Executar a query
+        query_success, result = execute_query_to_data_extension(token, sql, params['destino'])
+        if not query_success:
+            return jsonify({"error": "Failed to execute query", "details": result}), 500
+        
+        # Notificar usuário pelo BLIP
+        message = f" Base '{params['destino']}' criada com {params['limite']} leads!"
+        if user_id:
+            send_blip_notification(message, user_id)
+        
+        return jsonify({
+            "success": True,
+            "message": message,
+            "params": params,
+            "sql": sql,
+            "result": result
+        })
+        
+    except Exception as e:
+        logging.error(f"Erro ao processar consulta: {str(e)}")
+        return jsonify({"error": f"Error processing query: {str(e)}"}), 500
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Endpoint para verificação de saúde da API"""
+    return jsonify({"status": "ok", "version": "1.0.0"})
+
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=5000)
