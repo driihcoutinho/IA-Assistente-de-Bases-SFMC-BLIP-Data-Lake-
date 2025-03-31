@@ -1,0 +1,170 @@
+# main.py - Módulo principal para processamento de linguagem natural
+
+import spacy
+import json
+import re
+from typing import Dict, Any, Optional, List
+
+# Carregar modelo NLP em português
+nlp = spacy.load("pt_core_news_lg")
+
+class QueryParser:
+    """
+    Classe para analisar comandos em linguagem natural e convertê-los em consultas SQL
+    para o Salesforce Marketing Cloud.
+    """
+    
+    def __init__(self):
+        # Mapeia termos comuns para colunas no banco de dados
+        self.column_mappings = {
+            "aluno": "alunos",
+            "alunos": "alunos",
+            "estado": "estado",
+            "região": "regiao",
+            "inadimplente": "situacao_financeira",
+            "inadimplentes": "situacao_financeira",
+            "ativo": "status",
+            "ativos": "status",
+            "graduação": "curso_interesse",
+            "pós-graduação": "curso_interesse",
+            "pós": "curso_interesse",
+            "último acesso": "ultimo_acesso",
+            "último": "ultimo_acesso",
+            "mês": "month",
+            "meses": "month"
+        }
+        
+        # Mapeamento de valores
+        self.value_mappings = {
+            "inadimplente": "inadimplente",
+            "adimplente": "adimplente",
+            "ativo": "ativo",
+            "inativo": "inativo",
+            "graduação": "graduação",
+            "pós-graduação": "pós-graduação"
+        }
+        
+        # Mapeamento de operadores
+        self.operators = {
+            "não": "!=",
+            "exceto": "!=",
+            "igual": "=",
+            "maior": ">",
+            "menor": "<",
+            "pelo menos": ">=",
+            "no máximo": "<=",
+            "últimos": ">"
+        }
+        
+        # Padrões para extração de números
+        self.number_pattern = re.compile(r'\b(\d+(?:\.\d+)?)\b')
+        self.limit_pattern = re.compile(r'\b(\d+(?:\.\d+)?)\s+(?:alunos|leads|pessoas|registros)\b')
+        
+    def parse_query(self, natural_query: str) -> Dict[str, Any]:
+        """
+        Analisa uma consulta em linguagem natural e extrai parâmetros para consulta SQL.
+        
+        Args:
+            natural_query: String com a consulta em linguagem natural
+            
+        Returns:
+            Dicionário com filtros, limite e destino da consulta
+        """
+        doc = nlp(natural_query.lower())
+        
+        # Extrair limite
+        limit_match = self.limit_pattern.search(natural_query.lower())
+        limit = int(limit_match.group(1)) if limit_match else 1000
+        
+        # Extrair filtros
+        filters = {}
+        
+        # Procurar estados/regiões
+        for ent in doc.ents:
+            if ent.label_ == "LOC":
+                if len(ent.text) == 2:  # Abreviação de estado
+                    filters["estado"] = ent.text.upper()
+                else:
+                    # Verificar se é uma região
+                    regions = ["norte", "sul", "sudeste", "nordeste", "centro-oeste"]
+                    if ent.text.lower() in regions:
+                        filters["regiao"] = ent.text.lower()
+        
+        # Procurar situação financeira
+        if "inadimplente" in natural_query.lower() or "inadimplentes" in natural_query.lower():
+            if "exceto" in natural_query.lower() or "não" in natural_query.lower():
+                filters["situacao_financeira"] = "adimplente"
+            else:
+                filters["situacao_financeira"] = "inadimplente"
+        
+        # Procurar status
+        if "ativo" in natural_query.lower() or "ativos" in natural_query.lower():
+            filters["status"] = "ativo"
+        
+        # Procurar curso de interesse
+        if "graduação" in natural_query.lower():
+            if "pós" in natural_query.lower() or "pós-graduação" in natural_query.lower():
+                filters["curso_interesse"] = "pós-graduação"
+            else:
+                filters["curso_interesse"] = "graduação"
+        
+        # Procurar período de tempo
+        time_match = re.search(r'(\d+)\s+meses', natural_query.lower())
+        if time_match:
+            months = int(time_match.group(1))
+            filters["ultimo_acesso"] = f">DATEADD(month, -{months}, GETDATE())"
+        
+        # Extrair nome da campanha para o destino
+        campaign_match = re.search(r'campanha\s+de\s+(\w+(?:-\w+)?)', natural_query.lower())
+        campaign = campaign_match.group(1) if campaign_match else "geral"
+        
+        destination = f"DE_CAMPANHA_{campaign.upper()}_{self._get_date_code()}"
+        
+        return {
+            "filtros": filters,
+            "limite": limit,
+            "destino": destination
+        }
+    
+    def generate_sql(self, params: Dict[str, Any]) -> str:
+        """
+        Gera uma consulta SQL a partir dos parâmetros extraídos.
+        
+        Args:
+            params: Dicionário com filtros, limite e destino
+            
+        Returns:
+            String contendo a consulta SQL
+        """
+        sql = f"SELECT TOP {params['limite']} *\nFROM alunos\nWHERE 1=1"
+        
+        for key, value in params['filtros'].items():
+            if "DATEADD" in str(value):
+                sql += f"\nAND {key} {value}"
+            else:
+                sql += f"\nAND {key} = '{value}'"
+        
+        return sql
+    
+    def _get_date_code(self) -> str:
+        """Retorna um código de data no formato YYYY_MM para uso em nomes de Data Extensions"""
+        from datetime import datetime
+        now = datetime.now()
+        return f"{now.year}_{now.month:02d}"
+        
+# Exemplo de uso
+if __name__ == "__main__":
+    parser = QueryParser()
+    
+    # Exemplo de consulta
+    query = "Preciso de uma base de 2.000 alunos de MG, ativos nos últimos 6 meses, para campanha de graduação."
+    
+    # Analisar a consulta
+    params = parser.parse_query(query)
+    print("Parâmetros extraídos:")
+    print(json.dumps(params, indent=2, ensure_ascii=False))
+    
+    # Gerar SQL
+    sql = parser.generate_sql(params)
+    print("\nSQL gerado:")
+    print(sql)
